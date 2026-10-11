@@ -148,17 +148,21 @@ Each preference pair produces one Bradley–Terry loss, even though it requires 
 
 # Loss and gradient accumulation
 
-For microbatch $j$, containing two preference pairs:
+The first run used two preference pairs per microbatch:
 
 $$L_j=\frac{\ell_{2j-1}+\ell_{2j}}{2}.$$
 
-The training loop scales each microbatch loss and calls backward:
+and accumulated eight scaled backward passes:
 
 $$G \leftarrow G + \frac{1}{8}\nabla L_j.$$
 
-`backward()` adds into one gradient buffer for every parameter; it does not preserve eight separate gradient objects. The weights remain unchanged during these eight backward passes.
+The 10K run used one pair per microbatch, so $L_j=\ell_j$, and accumulated sixteen passes:
 
-After microbatch 8:
+$$G \leftarrow G + \frac{1}{16}\nabla \ell_j.$$
+
+`backward()` adds into one gradient buffer for every parameter. It does not preserve separate gradient objects, and the model weights remain unchanged until the optimizer step.
+
+Both configurations therefore produce the same effective 16-pair gradient:
 
 $$G=\nabla\left[\frac{1}{16}\sum_{i=1}^{16}\ell_i\right].$$
 
@@ -166,7 +170,7 @@ AdamW performs one `optimizer.step()`, then `zero_grad()` clears the buffers.
 
 ---
 
-# Our preference-RM run
+# First run: 5K pairs over two epochs
 
 - Requested pairs: **5,000**
 - Identical truncated pairs removed: **352**
@@ -195,11 +199,71 @@ This metric is **pairwise accuracy**, $\mathbb{1}[r_c>r_r]$, not ROC-AUC. Valida
 
 ---
 
+# What changed in the second run?
+
+| Configuration | 5K run | 10K run |
+|---|---:|---:|
+| Requested pairs | 5,000 | 10,000 |
+| Usable pairs after filtering | 4,648 | 9,276 |
+| Train / validation pairs | 4,183 / 465 | 8,812 / 464 |
+| Epochs | 2 | 1 |
+| Microbatch × accumulation | 2 × 8 | 1 × 16 |
+| Effective batch | 16 pairs | 16 pairs |
+| Learning rate | $5\times10^{-5}$ | $5\times10^{-5}$ |
+| Optimizer updates | 524 | 551 |
+
+The update budget stayed nearly constant, but the 10K run used roughly twice as many unique training pairs instead of repeating the smaller dataset. Its smaller microbatch reduces activation memory but requires more forward/backward iterations per update.
+
+---
+
+# Second run: 10K pairs for one epoch
+
+- Usable pairs: **9,276**
+- Training pairs: **8,812**
+- Validation pairs: **464**
+- Warmup: **55 of 551 optimizer steps**
+- Epoch training average: loss **0.5207**, accuracy **73.6%**
+- Final validation: loss **0.4348**, accuracy **79.1%**, margin **1.4018**
+
+Only the final validation measurement was logged, so it should be shown as a reference line—not interpreted as a validation curve over time.
+
+---
+
+# 10K run: loss
+
+![10K preference RM training loss and final validation loss](assets/loss-curve-10k.svg)
+
+The trailing training mean continued improving through most of the epoch. The final validation loss of **0.4348** is below the first run's best logged validation loss of **0.4583**.
+
+---
+
+# 10K run: pairwise accuracy
+
+![10K preference RM training and final validation accuracy](assets/accuracy-curve-10k.svg)
+
+Final validation accuracy reached **79.1%**, compared with the first run's best logged **78.9%** and final **76.6%**. Because the dataset size and validation split changed, this is encouraging rather than a perfectly controlled comparison.
+
+---
+
+# Comparing the two training strategies
+
+| Validation result | 5K × 2 epochs | 10K × 1 epoch |
+|---|---:|---:|
+| Best logged loss | 0.4583 | — |
+| Final loss | 0.6096 | **0.4348** |
+| Best logged accuracy | 78.9% | — |
+| Final accuracy | 76.6% | **79.1%** |
+| Final reward margin | 2.5846 | **1.4018** |
+
+The two-epoch run produced a much larger reward margin while validation loss worsened, indicating overconfidence. The one-epoch run ended with a smaller margin and better final validation metrics. More unique data plus no repeated epoch appears to generalize better, although intermediate validation checkpoints are needed to locate the true optimum.
+
+---
+
 # Main takeaways
 
 1. The backbone encodes the complete prompt-response context; the head converts selected hidden states into reward or class scores.
 2. Preference RM learns relative ordering from pairs; ORM learns final success from individual responses; PRM learns step-level quality.
 3. A loss mask controls where direct supervision is applied—not which earlier tokens can affect a supervised hidden state.
-4. Gradient accumulation over eight microbatches of two is mathematically equivalent to averaging 16 pair losses before one update, assuming no intervening weight update.
-5. Select checkpoints using validation behavior: the lowest validation loss and highest validation accuracy occurred well before the end of epoch 2.
-
+4. Accumulating `2 × 8` or `1 × 16` produces the same 16-pair average gradient; `1 × 16` saves activation memory but is usually slower.
+5. With a similar number of optimizer updates, one pass over roughly twice as many unique pairs generalized better than two passes over the smaller dataset.
+6. The 10K run needs intermediate validation logging to determine whether its best checkpoint occurs before step 551.
